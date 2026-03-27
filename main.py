@@ -1279,7 +1279,7 @@ class AsyncTradingBot:
             abs_size = abs(current_position_size)
             info_logger.info(f"{log_prefix} Post-cancel re-check: position={current_position_size}, target={target_quantity}")
         
-        # 4. Check if position is overfilled — if so, reduce back to target
+        # 4. Check if position is overfilled — if so, reduce back to target with retry loop
         overfill_threshold = target_quantity * 1.01  # 1% tolerance
         if abs_size > overfill_threshold and direction == expected_side:
             excess = abs_size - target_quantity
@@ -1287,36 +1287,121 @@ class AsyncTradingBot:
             
             try:
                 asset_info = self._get_asset_info(asset)
-                formatted_excess = self._format_size(excess, asset_info['szDecimals'])
+                reduce_is_buy = not is_buy
+                reduce_order_id = None
+                reduce_max_retries = 7
+                reduce_retry = 0
+                reduce_slippage = 0.0
                 
-                if float(formatted_excess) > 0:
-                    # Close the excess (opposite direction, reduce_only)
-                    reduce_is_buy = not is_buy
-                    market_price = await asyncio.get_event_loop().run_in_executor(
-                        None, self._get_asset_mark_price, asset
-                    )
-                    reduce_price = self.exchange._slippage_price(asset, reduce_is_buy, 0.005, market_price)
-                    
-                    reduce_result = await asyncio.get_event_loop().run_in_executor(
-                        None, self.exchange.order, asset, reduce_is_buy, float(formatted_excess),
-                        reduce_price, {"limit": {"tif": "Gtc"}}, True  # reduce_only
-                    )
-                    info_logger.info(f"{log_prefix} Placed reduce order for {formatted_excess} at {reduce_price}: {reduce_result}")
-                    
-                    # Wait and verify the reduction
-                    await asyncio.sleep(5)
-                    
+                while True:
+                    # Get current position size
                     user_state = await asyncio.get_event_loop().run_in_executor(
                         None, self.info.user_state, self.address
                     )
+                    current_size = 0.0
                     for pos in user_state.get('assetPositions', []):
                         if pos["position"]["coin"] == asset:
-                            final_size = abs(float(pos["position"]["szi"]))
+                            current_size = abs(float(pos["position"]["szi"]))
                             entry_price = pos["position"].get("entryPx", entry_price)
-                            info_logger.info(f"{log_prefix} After reduction: position size={final_size}, target={target_quantity}")
                             break
                     
-                    # Cancel any leftover reduce orders (non-trigger only, preserve SL)
+                    # Check if we're within tolerance
+                    if current_size <= target_quantity * 1.01:
+                        info_logger.info(f"{log_prefix} Overfill corrected: position={current_size}, target={target_quantity}")
+                        break
+                    
+                    # Cancel previous reduce order if it exists
+                    if reduce_order_id:
+                        try:
+                            await asyncio.get_event_loop().run_in_executor(
+                                None, self.exchange.cancel, asset, reduce_order_id
+                            )
+                        except Exception as e:
+                            info_logger.warning(f"{log_prefix} Failed to cancel previous reduce order {reduce_order_id}: {e}")
+                        reduce_order_id = None
+                    
+                    # Also sweep any stale non-trigger limit orders
+                    try:
+                        all_orders = await asyncio.get_event_loop().run_in_executor(
+                            None, self.info.frontend_open_orders, self.address
+                        )
+                        for o in all_orders:
+                            if o['coin'] == asset and not o.get('isTrigger', False):
+                                try:
+                                    await asyncio.get_event_loop().run_in_executor(
+                                        None, self.exchange.cancel, asset, o['oid']
+                                    )
+                                except Exception as e:
+                                    info_logger.warning(f"{log_prefix} Failed to cancel stale order {o['oid']} during overfill reduction: {e}")
+                    except Exception as e:
+                        info_logger.warning(f"{log_prefix} Failed to fetch orders during overfill reduction: {e}")
+                    
+                    await asyncio.sleep(1)
+                    
+                    # Re-check position after cancellations (orders may have filled)
+                    user_state = await asyncio.get_event_loop().run_in_executor(
+                        None, self.info.user_state, self.address
+                    )
+                    current_size = 0.0
+                    for pos in user_state.get('assetPositions', []):
+                        if pos["position"]["coin"] == asset:
+                            current_size = abs(float(pos["position"]["szi"]))
+                            entry_price = pos["position"].get("entryPx", entry_price)
+                            break
+                    
+                    if current_size <= target_quantity * 1.01:
+                        info_logger.info(f"{log_prefix} Overfill corrected after cancel: position={current_size}, target={target_quantity}")
+                        break
+                    
+                    # Calculate excess to reduce
+                    excess = current_size - target_quantity
+                    formatted_excess = self._format_size(excess, asset_info['szDecimals'])
+                    
+                    if float(formatted_excess) <= 0:
+                        info_logger.info(f"{log_prefix} Excess too small to reduce after formatting: {excess}")
+                        break
+                    
+                    # Place reduce order with increasing aggression
+                    reduce_retry += 1
+                    market_price = await asyncio.get_event_loop().run_in_executor(
+                        None, self._get_asset_mark_price, asset
+                    )
+                    
+                    if reduce_retry >= reduce_max_retries:
+                        reduce_slippage += 0.002
+                        reduce_slippage = min(reduce_slippage, 0.04)
+                    
+                    if reduce_slippage > 0:
+                        order_price = self.exchange._slippage_price(asset, reduce_is_buy, reduce_slippage, market_price)
+                    else:
+                        order_price = float(self._format_price(market_price, asset))
+                    
+                    reduce_result = await asyncio.get_event_loop().run_in_executor(
+                        None, self.exchange.order, asset, reduce_is_buy, float(formatted_excess),
+                        order_price, {"limit": {"tif": "Gtc"}}, True  # reduce_only
+                    )
+                    
+                    info_logger.info(f"{log_prefix} Reduce order attempt {reduce_retry}: {formatted_excess} at {order_price} (slippage: {reduce_slippage})")
+                    
+                    # Extract order ID for next cancel cycle
+                    if isinstance(reduce_result, dict) and reduce_result.get('status') != 'err':
+                        try:
+                            status = reduce_result['response']['data']['statuses'][0]
+                            reduce_order_id = status.get('resting', {}).get('oid')
+                            filled_data = status.get('filled', {})
+                            if filled_data and filled_data.get('oid'):
+                                filled_sz = float(filled_data.get('totalSz', 0))
+                                if abs(filled_sz - float(formatted_excess)) < (float(formatted_excess) * 0.01):
+                                    info_logger.info(f"{log_prefix} Reduce order filled immediately: {filled_sz}")
+                                    continue  # Re-check position at top of loop
+                        except (KeyError, IndexError, TypeError):
+                            reduce_order_id = None
+                    
+                    # Wait before next check
+                    await asyncio.sleep(20)
+                
+                # Final cleanup: cancel any leftover non-trigger orders
+                try:
                     all_orders = await asyncio.get_event_loop().run_in_executor(
                         None, self.info.frontend_open_orders, self.address
                     )
@@ -1325,12 +1410,13 @@ class AsyncTradingBot:
                             await asyncio.get_event_loop().run_in_executor(
                                 None, self.exchange.cancel, asset, order['oid']
                             )
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            info_logger.warning(f"{log_prefix} Failed to cancel lingering order {order['oid']} during final cleanup: {e}")
+                except Exception as e:
+                    info_logger.warning(f"{log_prefix} Failed to fetch orders during final cleanup: {e}")
                             
             except Exception as e:
                 info_logger.error(f"{log_prefix} Failed to reduce overfilled position: {e}")
-        
         return entry_price
 
     async def _monitor_order_fill(self, asset: str, order_id: str, params: dict, 
