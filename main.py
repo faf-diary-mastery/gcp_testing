@@ -1162,7 +1162,7 @@ class AsyncTradingBot:
                           
             # If order not immediately filled, start monitoring task
             if previous_order_id and not filled_order_id:
-                formatted_price = await asyncio.create_task(self._monitor_order_fill(
+                formatted_price, target_quantity = await asyncio.create_task(self._monitor_order_fill(
                     asset, previous_order_id, params, is_buy
                 ))
             elif filled_order_id:
@@ -1177,7 +1177,7 @@ class AsyncTradingBot:
                 else:
                     # Partial fill — continue monitoring for the remaining quantity
                     info_logger.warning(f"{log_prefix} Partial fill detected: got {filled_sz}, need {target_quantity}. Entering monitor loop for remainder.")
-                    formatted_price = await asyncio.create_task(self._monitor_order_fill(
+                    formatted_price, target_quantity = await asyncio.create_task(self._monitor_order_fill(
                         asset, None, params, is_buy
                     ))
             else:
@@ -1404,7 +1404,7 @@ class AsyncTradingBot:
         except Exception as e:
             info_logger.warning(f"{log_prefix} Failed to check for lingering orders: {e}")
 
-        return new_price
+        return new_price, target_quantity
     
     async def _retry_order_placement(self, asset: str, old_order_id: str, 
                                    target_quantity: float, is_buy: bool, market_order: bool, 
