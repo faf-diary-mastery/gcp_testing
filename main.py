@@ -38,7 +38,7 @@ WALLET1_API_KEY = os.getenv('WALLET1_API_KEY', '')
 
 # Price drift threshold for recalculating position quantity to maintain constant risk (1R)
 # If entry price drifts beyond this %, quantity is recalculated to keep dollar risk at SL constant
-PRICE_DRIFT_THRESHOLD_FOR_RISK_RECALC = 0.015  # 1.5% threshold
+PRICE_DRIFT_THRESHOLD_FOR_RISK_RECALC = 0.01  # 1.5% threshold
 
 # ///////////////////////////////////////////////////////////////////////////
 # LOGGING SETUP
@@ -569,7 +569,7 @@ class AsyncTradingBot:
             raise ValueError(f"Invalid portfolio value: {portfolio_value}")
         
         # Apply system-specific risk multiplier
-        effective_portfolio = portfolio_value * self.config["system_weight"]
+        effective_portfolio = portfolio_value * self.config["risk_multiplier"]
         
         # Calculate position size
         position_size = effective_portfolio * (alert.qty / 100.0)
@@ -594,12 +594,26 @@ class AsyncTradingBot:
         asset_info = self._get_asset_info(alert.ticker)
         formatted_quantity = self._format_size(quantity, asset_info['szDecimals'])
         
+        # Calculate original risk if stop loss is provided (for constant risk recalculation)
+        original_total_risk = None
+        if alert.stop_loss:
+            risk_per_unit = abs(alert.price - alert.stop_loss)
+            original_total_risk = risk_per_unit * float(formatted_quantity)
+        
         return {
             "asset": alert.ticker.upper(),
             "leverage": leverage,
             "margin": round(applied_margin, 2),
             "quantity": float(formatted_quantity),
-            "position_size": position_size
+            "position_size": position_size,
+            # Data for constant risk recalculation during retries
+            "original_entry_price": alert.price,
+            "stop_loss": alert.stop_loss,
+            "original_total_risk": original_total_risk,
+            "target_position_size_usd": position_size,
+            "sz_decimals": asset_info['szDecimals'],
+            "max_margin_per_pos": max_margin_per_pos,
+            "max_leverage": max_leverage,
         }
     
     
@@ -1330,6 +1344,7 @@ class AsyncTradingBot:
         prev_order_id = order_id
         slippage = 0.0
         new_price = None
+        recalc_result = None
                     
         while not filled: #retry_count < max_retries:
             await asyncio.sleep(40)  # Non-blocking sleep
@@ -1341,7 +1356,7 @@ class AsyncTradingBot:
                 if retry_count < max_retries:
                     market_order = False
                     # Cancel previous order and place new one (async)
-                    new_price, new_order_id, retry_fill = await self._retry_order_placement(
+                    new_price, new_order_id, retry_fill, recalc_result = await self._retry_order_placement(
                         asset, prev_order_id, target_quantity, is_buy, market_order, 
                         slippage, expected_side, params)
 
@@ -1350,15 +1365,23 @@ class AsyncTradingBot:
                     slippage += 0.002
                     slippage = min(slippage, 0.04) # 4% slippage max
                     # increasingly aggressive limit order to ensure position is taken
-                    new_price, new_order_id, retry_fill = await self._retry_order_placement(
+                    new_price, new_order_id, retry_fill, recalc_result = await self._retry_order_placement(
                         asset, prev_order_id, target_quantity, is_buy, market_order, 
                         slippage, expected_side, params)
                 
+                # Update target quantity if recalculation occurred
+                if recalc_result and recalc_result.get('recalculated'):
+                    target_quantity = recalc_result['new_quantity']
+                    params['quantity'] = target_quantity
+
                 filled = retry_fill
                 if new_order_id is not None:
                     prev_order_id = new_order_id
             except Exception as e:
                 info_logger.error(f"{log_prefix} Monitor error: {e}")
+                if recalc_result and recalc_result.get('recalculated'):
+                    target_quantity = recalc_result['new_quantity']
+                    params['quantity'] = target_quantity
                 if "insufficient" in str(e).lower():
                     break
 
@@ -1387,6 +1410,7 @@ class AsyncTradingBot:
                                    slippage: float, expected_side: str, params: dict = None):
         """Place retry order asynchronously"""
         log_prefix = f"[{self.config['trade_log_prefix']} RETRY {asset}]"
+        recalc_result = None
         try:
             
             if old_order_id:
@@ -1451,7 +1475,7 @@ class AsyncTradingBot:
                         break
                 
                 info_logger.info(f"Retry: Position filled successfully: {current_position_size}")
-                return entry_price, None, True  # return actual price instead of None
+                return entry_price, None, True, recalc_result  # return actual price instead of None
             
             # Calculate remaining and place new order if needed
             current_amount = abs(current_position_size) if direction == expected_side else 0.0
@@ -1466,7 +1490,7 @@ class AsyncTradingBot:
                         break
 
                 info_logger.info(f"Retry: Position essentially complete")
-                return entry_price, None, True
+                return entry_price, None, True, recalc_result
             
             # Get current market price and place new order
             market_price = await asyncio.get_event_loop().run_in_executor(
@@ -1521,16 +1545,16 @@ class AsyncTradingBot:
             # Handle order result
             if isinstance(order_result, str):
                 info_logger.error(f"{log_prefix} Order failed with error: {order_result}")
-                return None, None, False
+                return None, None, False, recalc_result
             
             if not isinstance(order_result, dict):
                 info_logger.error(f"{log_prefix} Unexpected order result type: {type(order_result)}")
-                return None, None, False
+                return None, None, False, recalc_result
             
             # Check for API error response
             if order_result.get('status') == 'err':
                 info_logger.error(f"{log_prefix} Order error: {order_result.get('response')}")
-                return None, None, False
+                return None, None, False, recalc_result
             
             # Extract order ID
             try:
@@ -1547,25 +1571,25 @@ class AsyncTradingBot:
                         # so we check if filled size is within 1% of remaining quantity to confirm it was genuinely filled
                         if abs(filled_sz - float(formatted_remaining)) < (float(formatted_remaining) * 0.01):
                             info_logger.info(f"{log_prefix} Order filled immediately: ID:{filled_oid} ({filled_sz} @ {avg_px})")
-                            return avg_px, filled_oid, True
+                            return avg_px, filled_oid, True, recalc_result
                         else:
                             info_logger.warning(f"{log_prefix} Partial immediate fill: {filled_sz}/{formatted_remaining} @ {avg_px}, will retry remaining on next iteration")
-                            return formatted_price, None, False
+                            return formatted_price, None, False, recalc_result
                     else:
                         info_logger.warning(f"{log_prefix} No resting or filled OID in response: {order_status}")
-                        return formatted_price, None, False
+                        return formatted_price, None, False, recalc_result
                             
                 info_logger.info(f"{log_prefix} Retry order placed: {formatted_remaining} at {formatted_price} (ID: {previous_order_id})")
-                return formatted_price, previous_order_id, False
+                return formatted_price, previous_order_id, False, recalc_result
                 ## Returning the ID makes it possible to cancle the prior order on the next run through
                 
             except (KeyError, IndexError, TypeError) as parse_error:
                 info_logger.error(f"{log_prefix} Failed to parse order response: {parse_error}\nOrder result: {order_result}")
-                return formatted_price, None, False
+                return formatted_price, None, False, recalc_result
 
         except Exception as e:
             info_logger.error(f"Retry order failed: {e}")
-            return None, None, False
+            return None, None, False, None
 
     async def _place_stop_loss_async(self, asset: str, alert: Alert, params: dict, is_buy: bool):
         """Place stop loss order asynchronously"""
