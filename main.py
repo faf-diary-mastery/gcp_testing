@@ -9,10 +9,11 @@ import logging
 from fastapi.responses import JSONResponse
 import requests
 
+
 from dataclasses import dataclass
 from datetime    import datetime, timezone
 from decimal     import Decimal
-from typing      import Dict, Optional, List, Set
+from typing      import Dict, Optional, List, Set, Tuple
 from enum        import Enum
 
 from eth_account import Account
@@ -34,6 +35,10 @@ WALLET1_API_KEY = os.getenv('WALLET1_API_KEY', '')
 # info_logging_url  = os.getenv('INFO_LOGGING_URL', '')
 # trade_logging_url = os.getenv('TRADE_LOGGING_URL', '')
 
+
+# Price drift threshold for recalculating position quantity to maintain constant risk (1R)
+# If entry price drifts beyond this %, quantity is recalculated to keep dollar risk at SL constant
+PRICE_DRIFT_THRESHOLD_FOR_RISK_RECALC = 0.015  # 1.5% threshold
 
 # ///////////////////////////////////////////////////////////////////////////
 # LOGGING SETUP
@@ -597,6 +602,137 @@ class AsyncTradingBot:
             "position_size": position_size
         }
     
+    
+    def _recalculate_quantity_for_constant_risk(
+        self, 
+        params: dict, 
+        new_price: float, 
+        is_buy: bool,
+        price_drift_threshold: float = PRICE_DRIFT_THRESHOLD_FOR_RISK_RECALC
+    ) -> Tuple[float, bool, Optional[dict]]:
+        """
+        Recalculate quantity to maintain CONSTANT RISK (1R) when entry price drifts.
+        
+        Risk = (Entry Price - Stop Loss) × Quantity
+        We want: New Risk = Original Risk
+        
+        If no stop loss -> return error
+        If recalculated quantity exceeds margin limits, caps at max allowed.
+        
+        Args:
+            params: Position parameters from _calculate_position_parameters
+            new_price: Current market price
+            is_buy: True if long position, False if short
+            price_drift_threshold: % threshold to trigger recalculation (default 1.5%)
+        
+        Returns:
+            tuple: (new_quantity, was_recalculated, recalc_info_dict)
+        """
+
+        # NOTE - IMPORTANT - For some systems the risk is 0.2R or 0.6R instead of 1R
+        # However, this calculation looks at the Risk $ amount so it will work
+        # Just relevant to not get sucked into fixating on 1R, but rather keeping same given $ risk amount
+
+        original_price = params.get('original_entry_price', new_price)
+        original_quantity = params['quantity']
+        stop_loss = params.get('stop_loss')
+        sz_decimals = params.get('sz_decimals', 3)
+        
+        # Calculate price drift
+        if original_price > 0:
+            price_drift = abs(new_price - original_price) / original_price
+        else:
+            price_drift = 0
+        
+        # Check if drift exceeds threshold
+        if price_drift <= price_drift_threshold:
+            return original_quantity, False, None
+        
+        log_prefix = f"[{self.system_id} RISK RECALC]"
+        
+        # If no stop loss provided, fall back to maintaining USD exposure
+        if not stop_loss:
+            target_position_size_usd = params.get('target_position_size_usd', 0)
+            if target_position_size_usd <= 0:
+                return original_quantity, False, None
+            
+            new_quantity = target_position_size_usd / new_price
+            formatted_quantity = float(self._format_size(new_quantity, sz_decimals))
+            
+            info_logger.info(
+                f"{log_prefix} No SL provided. Maintaining USD exposure: "
+                f"${target_position_size_usd:.2f} / ${new_price:.2f} = {formatted_quantity}"
+            )
+            
+            recalc_info = {
+                "method": "usd_exposure",
+                "price_drift_pct": price_drift * 100,
+                "original_quantity": original_quantity,
+                "new_quantity": formatted_quantity,
+            }
+            return formatted_quantity, True, recalc_info
+        
+        # Calculate original risk in dollars
+        original_risk_per_unit = abs(original_price - stop_loss)
+        original_total_risk = params.get('original_total_risk')
+        
+        if original_total_risk is None:
+            original_total_risk = original_risk_per_unit * original_quantity
+        
+        # Calculate new quantity to maintain same total risk
+        new_risk_per_unit = abs(new_price - stop_loss)
+        
+        if new_risk_per_unit <= 0:
+            info_logger.warning(
+                f"{log_prefix} Invalid risk calculation: Entry ${new_price:.2f}, "
+                f"SL ${stop_loss:.2f}. Keeping original quantity."
+            )
+            return original_quantity, False, None
+        
+        new_quantity = original_total_risk / new_risk_per_unit
+        
+        # Cap quantity if it exceeds margin limits
+        max_margin = params.get('max_margin_per_pos', float('inf'))
+        max_leverage = params.get('max_leverage', 5)
+        max_position_size = max_margin * max_leverage
+        max_quantity = max_position_size / new_price if new_price > 0 else new_quantity
+        
+        quantity_was_capped = False
+        if new_quantity > max_quantity:
+            info_logger.warning(
+                f"{log_prefix} Recalculated quantity {new_quantity:.6f} exceeds max "
+                f"{max_quantity:.6f} (margin limit). Capping."
+            )
+            new_quantity = max_quantity
+            quantity_was_capped = True
+        
+        formatted_quantity = float(self._format_size(new_quantity, sz_decimals))
+        
+        # Calculate what the new risk will be (may differ slightly due to formatting)
+        actual_new_risk = new_risk_per_unit * formatted_quantity
+        
+        info_logger.info(
+            f"{log_prefix} CONSTANT RISK recalc triggered (drift: {price_drift*100:.2f}%)\n"
+            f"  Original: {original_quantity} @ ${original_price:.2f} "
+            f"(risk/unit: ${original_risk_per_unit:.2f}, total: ${original_total_risk:.2f})\n"
+            f"  New: {formatted_quantity} @ ${new_price:.2f} "
+            f"(risk/unit: ${new_risk_per_unit:.2f}, total: ${actual_new_risk:.2f})"
+            f"{' [CAPPED]' if quantity_was_capped else ''}"
+        )
+        
+        recalc_info = {
+            "method": "constant_risk",
+            "price_drift_pct": price_drift * 100,
+            "original_quantity": original_quantity,
+            "new_quantity": formatted_quantity,
+            "original_risk": original_total_risk,
+            "new_risk": actual_new_risk,
+            "was_capped": quantity_was_capped,
+        }
+        
+        return formatted_quantity, True, recalc_info
+
+
     def _asset_has_existing_position(self, ticker: str) -> bool:
         """Check if asset has existing position"""
         try:
@@ -832,8 +968,8 @@ class AsyncTradingBot:
                     if "insufficient" in str(e).lower():
                         break
             
-            # Cancel any remaining open limit orders for this asset to prevent orphans
-            # open_orders() only returns resting limit orders, not trigger orders (stop-loss stays intact)
+            # Cancel any remaining open orders for this asset to prevent orphans
+            # During position close, we cancel all orders (including SL triggers) since the position is being exited
             try:
                 remaining_orders = self.info.open_orders(self.address)
                 asset_remaining = [o for o in remaining_orders if o['coin'] == asset]
@@ -1086,22 +1222,23 @@ class AsyncTradingBot:
         
         info_logger.info(f"{log_prefix} Post-fill verify: position={current_position_size}, target={target_quantity}, direction={direction}, expected={expected_side}")
         
-        # 2. Cancel all resting limit orders for this asset (stop-loss trigger orders are NOT returned by open_orders)
+        # 2. Cancel only non-trigger (limit) orders — preserve stop-loss trigger orders
         cancelled_any = False
         try:
-            open_orders = await asyncio.get_event_loop().run_in_executor(
-                None, self.info.open_orders, self.address
+            all_orders = await asyncio.get_event_loop().run_in_executor(
+                None, self.info.frontend_open_orders, self.address
             )
-            asset_orders = [o for o in open_orders if o['coin'] == asset]
+            # Only cancel non-trigger limit orders; keep SL/TP trigger orders intact
+            asset_limit_orders = [o for o in all_orders if o['coin'] == asset and not o.get('isTrigger', False)]
             
-            if asset_orders:
-                info_logger.info(f"{log_prefix} Found {len(asset_orders)} lingering resting order(s) after fill, cancelling...")
-                for order in asset_orders:
+            if asset_limit_orders:
+                info_logger.info(f"{log_prefix} Found {len(asset_limit_orders)} lingering limit order(s) after fill, cancelling (preserving trigger orders)...")
+                for order in asset_limit_orders:
                     try:
                         await asyncio.get_event_loop().run_in_executor(
                             None, self.exchange.cancel, asset, order['oid']
                         )
-                        info_logger.info(f"{log_prefix} Cancelled lingering order {order['oid']}")
+                        info_logger.info(f"{log_prefix} Cancelled lingering limit order {order['oid']}")
                         cancelled_any = True
                     except Exception:
                         info_logger.warning(f"{log_prefix} Failed to cancel lingering order {order['oid']}")
@@ -1164,11 +1301,11 @@ class AsyncTradingBot:
                             info_logger.info(f"{log_prefix} After reduction: position size={final_size}, target={target_quantity}")
                             break
                     
-                    # Cancel any leftover reduce orders
-                    open_orders = await asyncio.get_event_loop().run_in_executor(
-                        None, self.info.open_orders, self.address
+                    # Cancel any leftover reduce orders (non-trigger only, preserve SL)
+                    all_orders = await asyncio.get_event_loop().run_in_executor(
+                        None, self.info.frontend_open_orders, self.address
                     )
-                    for order in [o for o in open_orders if o['coin'] == asset]:
+                    for order in [o for o in all_orders if o['coin'] == asset and not o.get('isTrigger', False)]:
                         try:
                             await asyncio.get_event_loop().run_in_executor(
                                 None, self.exchange.cancel, asset, order['oid']
@@ -1204,14 +1341,18 @@ class AsyncTradingBot:
                 if retry_count < max_retries:
                     market_order = False
                     # Cancel previous order and place new one (async)
-                    new_price, new_order_id, retry_fill = await self._retry_order_placement(asset, prev_order_id, target_quantity, is_buy, market_order, slippage, expected_side)
+                    new_price, new_order_id, retry_fill = await self._retry_order_placement(
+                        asset, prev_order_id, target_quantity, is_buy, market_order, 
+                        slippage, expected_side, params)
 
                 elif retry_count >= max_retries:
                     market_order = True
                     slippage += 0.002
                     slippage = min(slippage, 0.04) # 4% slippage max
                     # increasingly aggressive limit order to ensure position is taken
-                    new_price, new_order_id, retry_fill = await self._retry_order_placement(asset, prev_order_id, target_quantity, is_buy, market_order, slippage, expected_side)
+                    new_price, new_order_id, retry_fill = await self._retry_order_placement(
+                        asset, prev_order_id, target_quantity, is_buy, market_order, 
+                        slippage, expected_side, params)
                 
                 filled = retry_fill
                 if new_order_id is not None:
@@ -1221,20 +1362,19 @@ class AsyncTradingBot:
                 if "insufficient" in str(e).lower():
                     break
 
-        # Cancel ALL remaining open limit orders for this asset to prevent orphans
-        # This catches orders we may have lost track of (e.g. when order ID parsing failed)
-        # Note: open_orders() only returns resting limit orders, not trigger orders (stop-loss stays intact)
+        # Cancel remaining non-trigger limit orders for this asset to prevent orphans
+        # Uses frontend_open_orders to distinguish limit orders from SL/TP trigger orders
         try:
-            open_orders = await asyncio.get_event_loop().run_in_executor(
-                None, self.info.open_orders, self.address
+            all_orders = await asyncio.get_event_loop().run_in_executor(
+                None, self.info.frontend_open_orders, self.address
             )
-            asset_orders = [o for o in open_orders if o['coin'] == asset]
-            for order in asset_orders:
+            asset_limit_orders = [o for o in all_orders if o['coin'] == asset and not o.get('isTrigger', False)]
+            for order in asset_limit_orders:
                 try:
                     await asyncio.get_event_loop().run_in_executor(
                         None, self.exchange.cancel, asset, order['oid']
                     )
-                    info_logger.info(f"{log_prefix} Cleaned up lingering order {order['oid']}")
+                    info_logger.info(f"{log_prefix} Cleaned up lingering limit order {order['oid']}")
                 except Exception:
                     info_logger.warning(f"{log_prefix} Failed to cancel lingering order {order['oid']}")
         except Exception as e:
@@ -1243,16 +1383,35 @@ class AsyncTradingBot:
         return new_price
     
     async def _retry_order_placement(self, asset: str, old_order_id: str, 
-                                   target_quantity: float, is_buy: bool, market_order: bool, slippage: float, expected_side: str):
+                                   target_quantity: float, is_buy: bool, market_order: bool, 
+                                   slippage: float, expected_side: str, params: dict = None):
         """Place retry order asynchronously"""
         log_prefix = f"[{self.config['trade_log_prefix']} RETRY {asset}]"
         try:
             
             if old_order_id:
-            # Cancel old order
+                # Cancel old order by ID
                 await asyncio.get_event_loop().run_in_executor(
                     None, self.exchange.cancel, asset, old_order_id
                 )
+            
+            # Sweep any stale non-trigger limit orders for this asset
+            # Prevents order accumulation when order IDs are lost due to parsing failures
+            try:
+                all_orders = await asyncio.get_event_loop().run_in_executor(
+                    None, self.info.frontend_open_orders, self.address
+                )
+                stale_limit_orders = [o for o in all_orders if o['coin'] == asset and not o.get('isTrigger', False)]
+                for stale_order in stale_limit_orders:
+                    try:
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, self.exchange.cancel, asset, stale_order['oid']
+                        )
+                        info_logger.info(f"{log_prefix} Cancelled stale limit order {stale_order['oid']}")
+                    except Exception:
+                        pass
+            except Exception as e:
+                info_logger.warning(f"{log_prefix} Failed to sweep stale orders: {e}")
             
             await asyncio.sleep(1)  # Brief pause
 
@@ -1314,6 +1473,31 @@ class AsyncTradingBot:
                 None, self._get_asset_mark_price, asset
             )
             
+            # Recalculate quantity for constant risk if params available
+            if params:
+                new_quantity, was_recalculated, recalc_info = self._recalculate_quantity_for_constant_risk(
+                    params, market_price, is_buy
+                )
+                
+                if was_recalculated:
+                    info_logger.info(
+                        f"{log_prefix} Target quantity updated: {target_quantity:.6f} → {new_quantity:.6f} "
+                        f"(maintaining constant risk)"
+                    )
+                    target_quantity = new_quantity
+                    recalc_result = {
+                        'recalculated': True,
+                        'new_quantity': new_quantity,
+                        'info': recalc_info
+                    }
+            
+            # Calculate remaining and place new order if needed
+            remaining = target_quantity - current_amount
+            
+            if remaining <= target_quantity * 0.01:
+                info_logger.info(f"{log_prefix} Position essentially complete")
+                return None, None, True, recalc_result
+
             formatted_price = self._format_price(market_price, asset)
             asset_info = self._get_asset_info(asset)
             formatted_remaining = self._format_size(remaining, asset_info['szDecimals'])
