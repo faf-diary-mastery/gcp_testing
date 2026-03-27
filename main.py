@@ -1071,6 +1071,7 @@ class AsyncTradingBot:
         """Async version of open_position with proper concurrency handling"""
         asset = alert.ticker.upper()
         log_prefix = f"[{self.config['trade_log_prefix']} OPEN {alert.action.upper()} {asset}]"
+        formatted_price = str(alert.price)
         
         # Use lock to prevent concurrent position modifications for same asset
         async with self._lock:
