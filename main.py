@@ -31,8 +31,8 @@ app = FastAPI(title="Multi Factor Engine", version="3.0.0")
 WALLET1_ADDRESS = os.getenv('WALLET1_ADDRESS', '')
 WALLET1_API_KEY = os.getenv('WALLET1_API_KEY', '')
 
-info_logging_url  = os.getenv('INFO_LOGGING_URL', '')
-trade_logging_url = os.getenv('TRADE_LOGGING_URL', '')
+# info_logging_url  = os.getenv('INFO_LOGGING_URL', '')
+# trade_logging_url = os.getenv('TRADE_LOGGING_URL', '')
 
 
 # ///////////////////////////////////////////////////////////////////////////
@@ -832,6 +832,20 @@ class AsyncTradingBot:
                     if "insufficient" in str(e).lower():
                         break
             
+            # Cancel any remaining open limit orders for this asset to prevent orphans
+            # open_orders() only returns resting limit orders, not trigger orders (stop-loss stays intact)
+            try:
+                remaining_orders = self.info.open_orders(self.address)
+                asset_remaining = [o for o in remaining_orders if o['coin'] == asset]
+                for order in asset_remaining:
+                    try:
+                        self.exchange.cancel(asset, order['oid'])
+                        info_logger.info(f"{log_prefix} Cleaned up lingering order {order['oid']}")
+                    except Exception:
+                        info_logger.warning(f"{log_prefix} Failed to cancel lingering order {order['oid']}")
+            except Exception as e:
+                info_logger.warning(f"{log_prefix} Failed to check for lingering orders: {e}")
+
             # Final position check
             final_user_state = self.info.user_state(self.address)
             if not isinstance(final_user_state, dict):
@@ -872,6 +886,7 @@ class AsyncTradingBot:
             }
             trade_logger.error(f"Position close failed for {self.system_id}", extra=log_data)
             raise
+    
     
     def _log_position_success(self, asset: str, alert: Alert, params: dict, formatted_price: str):
         """Log successful position opening"""
@@ -989,15 +1004,33 @@ class AsyncTradingBot:
                 raise Exception(f"Entry order failed: {order_status['error']}")
             
             previous_order_id = order_status.get('resting', {}).get('oid')
-            filled_order_id = order_status.get('filled', {}).get('oid')
+            filled_data = order_status.get('filled', {})
+            filled_order_id = filled_data.get('oid') if filled_data else None
+            target_quantity = float(params['quantity'])
+            expected_side = "long" if is_buy else "short"
                           
             # If order not immediately filled, start monitoring task
             if previous_order_id and not filled_order_id:
                 formatted_price = await asyncio.create_task(self._monitor_order_fill(
                     asset, previous_order_id, params, is_buy
                 ))
+            elif filled_order_id:
+                # Order reported as filled — but verify actual filled size matches intended size
+                filled_sz = float(filled_data.get('totalSz', 0))
+                avg_px = filled_data.get('avgPx')
+                info_logger.info(f"{log_prefix} Initial order filled: {filled_sz}/{target_quantity} @ {avg_px}")
+                
+                if abs(filled_sz - target_quantity) < (target_quantity * 0.01):
+                    # Fully filled
+                    formatted_price = avg_px if avg_px else formatted_price
+                else:
+                    # Partial fill — continue monitoring for the remaining quantity
+                    info_logger.warning(f"{log_prefix} Partial fill detected: got {filled_sz}, need {target_quantity}. Entering monitor loop for remainder.")
+                    formatted_price = await asyncio.create_task(self._monitor_order_fill(
+                        asset, None, params, is_buy
+                    ))
             else:
-                # Check position status (async)
+                # No resting, no filled — check position directly
                 user_state = await asyncio.get_event_loop().run_in_executor(
                     None, self.info.user_state, self.address
                 )   
@@ -1006,6 +1039,11 @@ class AsyncTradingBot:
                     if position["position"]["coin"] == asset:
                         formatted_price = float(position["position"]["entryPx"])
                         break
+            
+            # Post-fill verification: ensure position size matches intent and no orphan orders remain
+            formatted_price = await self._verify_position_and_cleanup(
+                asset, target_quantity, is_buy, expected_side, formatted_price, log_prefix
+            )
             
             info_logger.info(f"{log_prefix} Position opened: {params['quantity']} at {formatted_price}")
             # Log success
@@ -1019,6 +1057,130 @@ class AsyncTradingBot:
             async with self._lock:
                 self._order_tracking.pop(asset, None)
     
+
+    async def _verify_position_and_cleanup(self, asset: str, target_quantity: float, 
+                                            is_buy: bool, expected_side: str, 
+                                            formatted_price, log_prefix: str):
+        """
+        Post-fill verification: ensure position size matches intent, cancel orphan orders,
+        and correct any overfill caused by orders filling during cleanup.
+        
+        Returns the final formatted_price (entry price from position).
+        """
+        # 1. Check actual position size on exchange
+        user_state = await asyncio.get_event_loop().run_in_executor(
+            None, self.info.user_state, self.address
+        )
+        positions = user_state.get('assetPositions', [])
+        current_position_size = 0.0
+        entry_price = formatted_price
+        
+        for pos in positions:
+            if pos["position"]["coin"] == asset:
+                current_position_size = float(pos["position"]["szi"])
+                entry_price = pos["position"].get("entryPx", formatted_price)
+                break
+        
+        direction = "long" if current_position_size > 0 else "short"
+        abs_size = abs(current_position_size)
+        
+        info_logger.info(f"{log_prefix} Post-fill verify: position={current_position_size}, target={target_quantity}, direction={direction}, expected={expected_side}")
+        
+        # 2. Cancel all resting limit orders for this asset (stop-loss trigger orders are NOT returned by open_orders)
+        cancelled_any = False
+        try:
+            open_orders = await asyncio.get_event_loop().run_in_executor(
+                None, self.info.open_orders, self.address
+            )
+            asset_orders = [o for o in open_orders if o['coin'] == asset]
+            
+            if asset_orders:
+                info_logger.info(f"{log_prefix} Found {len(asset_orders)} lingering resting order(s) after fill, cancelling...")
+                for order in asset_orders:
+                    try:
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, self.exchange.cancel, asset, order['oid']
+                        )
+                        info_logger.info(f"{log_prefix} Cancelled lingering order {order['oid']}")
+                        cancelled_any = True
+                    except Exception:
+                        info_logger.warning(f"{log_prefix} Failed to cancel lingering order {order['oid']}")
+        except Exception as e:
+            info_logger.warning(f"{log_prefix} Failed to fetch open orders for cleanup: {e}")
+        
+        # 3. If we cancelled orders, re-check position — those orders may have filled in the meantime
+        if cancelled_any:
+            await asyncio.sleep(1)  # Brief pause for cancellations to settle
+            
+            user_state = await asyncio.get_event_loop().run_in_executor(
+                None, self.info.user_state, self.address
+            )
+            positions = user_state.get('assetPositions', [])
+            current_position_size = 0.0
+            
+            for pos in positions:
+                if pos["position"]["coin"] == asset:
+                    current_position_size = float(pos["position"]["szi"])
+                    entry_price = pos["position"].get("entryPx", entry_price)
+                    break
+            
+            abs_size = abs(current_position_size)
+            info_logger.info(f"{log_prefix} Post-cancel re-check: position={current_position_size}, target={target_quantity}")
+        
+        # 4. Check if position is overfilled — if so, reduce back to target
+        overfill_threshold = target_quantity * 1.01  # 1% tolerance
+        if abs_size > overfill_threshold and direction == expected_side:
+            excess = abs_size - target_quantity
+            info_logger.warning(f"{log_prefix} Position OVERFILLED: {abs_size} vs target {target_quantity}, reducing by {excess}")
+            
+            try:
+                asset_info = self._get_asset_info(asset)
+                formatted_excess = self._format_size(excess, asset_info['szDecimals'])
+                
+                if float(formatted_excess) > 0:
+                    # Close the excess (opposite direction, reduce_only)
+                    reduce_is_buy = not is_buy
+                    market_price = await asyncio.get_event_loop().run_in_executor(
+                        None, self._get_asset_mark_price, asset
+                    )
+                    reduce_price = self.exchange._slippage_price(asset, reduce_is_buy, 0.005, market_price)
+                    
+                    reduce_result = await asyncio.get_event_loop().run_in_executor(
+                        None, self.exchange.order, asset, reduce_is_buy, float(formatted_excess),
+                        reduce_price, {"limit": {"tif": "Gtc"}}, True  # reduce_only
+                    )
+                    info_logger.info(f"{log_prefix} Placed reduce order for {formatted_excess} at {reduce_price}: {reduce_result}")
+                    
+                    # Wait and verify the reduction
+                    await asyncio.sleep(5)
+                    
+                    user_state = await asyncio.get_event_loop().run_in_executor(
+                        None, self.info.user_state, self.address
+                    )
+                    for pos in user_state.get('assetPositions', []):
+                        if pos["position"]["coin"] == asset:
+                            final_size = abs(float(pos["position"]["szi"]))
+                            entry_price = pos["position"].get("entryPx", entry_price)
+                            info_logger.info(f"{log_prefix} After reduction: position size={final_size}, target={target_quantity}")
+                            break
+                    
+                    # Cancel any leftover reduce orders
+                    open_orders = await asyncio.get_event_loop().run_in_executor(
+                        None, self.info.open_orders, self.address
+                    )
+                    for order in [o for o in open_orders if o['coin'] == asset]:
+                        try:
+                            await asyncio.get_event_loop().run_in_executor(
+                                None, self.exchange.cancel, asset, order['oid']
+                            )
+                        except Exception:
+                            pass
+                            
+            except Exception as e:
+                info_logger.error(f"{log_prefix} Failed to reduce overfilled position: {e}")
+        
+        return entry_price
+
     async def _monitor_order_fill(self, asset: str, order_id: str, params: dict, 
                                   is_buy: bool):
         """Monitor order filling in background without blocking"""
@@ -1052,20 +1214,31 @@ class AsyncTradingBot:
                     new_price, new_order_id, retry_fill = await self._retry_order_placement(asset, prev_order_id, target_quantity, is_buy, market_order, slippage, expected_side)
                 
                 filled = retry_fill
-                prev_order_id = new_order_id
+                if new_order_id is not None:
+                    prev_order_id = new_order_id
             except Exception as e:
                 info_logger.error(f"{log_prefix} Monitor error: {e}")
                 if "insufficient" in str(e).lower():
                     break
-                
-        if prev_order_id and not filled:
-            try:
-                await asyncio.get_event_loop().run_in_executor(
-                    None, self.exchange.cancel, asset, prev_order_id
-                )
-                info_logger.info(f"{log_prefix} Cancelled orphan order {prev_order_id}")
-            except Exception:
-                info_logger.warning(f"{log_prefix} Failed to cancel orphan order {prev_order_id}")
+
+        # Cancel ALL remaining open limit orders for this asset to prevent orphans
+        # This catches orders we may have lost track of (e.g. when order ID parsing failed)
+        # Note: open_orders() only returns resting limit orders, not trigger orders (stop-loss stays intact)
+        try:
+            open_orders = await asyncio.get_event_loop().run_in_executor(
+                None, self.info.open_orders, self.address
+            )
+            asset_orders = [o for o in open_orders if o['coin'] == asset]
+            for order in asset_orders:
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, self.exchange.cancel, asset, order['oid']
+                    )
+                    info_logger.info(f"{log_prefix} Cleaned up lingering order {order['oid']}")
+                except Exception:
+                    info_logger.warning(f"{log_prefix} Failed to cancel lingering order {order['oid']}")
+        except Exception as e:
+            info_logger.warning(f"{log_prefix} Failed to check for lingering orders: {e}")
 
         return new_price
     
