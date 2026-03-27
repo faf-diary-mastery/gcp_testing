@@ -569,7 +569,7 @@ class AsyncTradingBot:
             raise ValueError(f"Invalid portfolio value: {portfolio_value}")
         
         # Apply system-specific risk multiplier
-        effective_portfolio = portfolio_value * self.config["risk_multiplier"]
+        effective_portfolio = portfolio_value * self.config["system_weight"]
         
         # Calculate position size
         position_size = effective_portfolio * (alert.qty / 100.0)
